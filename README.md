@@ -36,30 +36,20 @@ If it's easier, you can run the following command to download the file
 on the command line (note that this is dependent on the current system of Google verification, and can change):
 ```
 cd data
-FILE_ID="1gwzIRBmn0a4Orj2okMNQ9qiPPpxmqdKA"
-FILE_NAME="aloha_twomodes_single.zip"
-TMP_HTML="/tmp/gdrive_download.html"
+export FILE_ID="1gwzIRBmn0a4Orj2okMNQ9qiPPpxmqdKA" FILE_NAME="aloha_twomodes_single.zip" TMP_HTML="/tmp/gdrive_download.html"
 
-# Step 1: Get the interstitial download page
 wget --quiet --save-cookies /tmp/cookies.txt --keep-session-cookies --no-check-certificate \
 "https://drive.google.com/uc?export=download&id=${FILE_ID}" -O "${TMP_HTML}"
 
-# Step 2: Parse all required fields from the form
-UUID=$(grep -oP 'name="uuid" value="\K[^"]+' "${TMP_HTML}")
-CONFIRM=$(grep -oP 'name="confirm" value="\K[^"]+' "${TMP_HTML}")
-# Double check confirm fallback
-[ -z "$CONFIRM" ] && CONFIRM="t"
+export UUID=$(grep -oP 'name="uuid" value="\K[^"]+' "${TMP_HTML}")
+export CONFIRM=$(grep -oP 'name="confirm" value="\K[^"]+' "${TMP_HTML}")
 
-# Step 3: Construct final download URL
-FINAL_URL="https://drive.usercontent.google.com/download?id=${FILE_ID}&export=download&confirm=${CONFIRM}&uuid=${UUID}"
+export FINAL_URL="https://drive.usercontent.google.com/download?id=${FILE_ID}&export=download&confirm=${CONFIRM}&uuid=${UUID}"
 
-# Step 4: Download the file
 wget --load-cookies /tmp/cookies.txt --no-check-certificate "$FINAL_URL" -O "${FILE_NAME}"
 
-# Clean up
 rm -f /tmp/cookies.txt "$TMP_HTML"
 
-# unzip and remove
 unzip aloha_twomodes_single.zip && rm -f aloha_twomodes_single.zip
 cd ..
 ```
@@ -69,30 +59,20 @@ If it's easier, you can run the following command to download the file
 on the command line (note that this is dependent on the current system of Google verification, and can change):
 ```
 cd data
-FILE_ID="1-ZDi8-aVx1I8aZCan-vXJQIpLyCCNwym"
-FILE_NAME="longhistsquare100.zip"
-TMP_HTML="/tmp/gdrive_download.html"
+export FILE_ID="1-ZDi8-aVx1I8aZCan-vXJQIpLyCCNwym" FILE_NAME="longhistsquare100.zip" TMP_HTML="/tmp/gdrive_download.html"
 
-# Step 1: Get the interstitial download page
 wget --quiet --save-cookies /tmp/cookies.txt --keep-session-cookies --no-check-certificate \
 "https://drive.google.com/uc?export=download&id=${FILE_ID}" -O "${TMP_HTML}"
 
-# Step 2: Parse all required fields from the form
-UUID=$(grep -oP 'name="uuid" value="\K[^"]+' "${TMP_HTML}")
-CONFIRM=$(grep -oP 'name="confirm" value="\K[^"]+' "${TMP_HTML}")
-# Double check confirm fallback
-[ -z "$CONFIRM" ] && CONFIRM="t"
+export UUID=$(grep -oP 'name="uuid" value="\K[^"]+' "${TMP_HTML}")
+export CONFIRM=$(grep -oP 'name="confirm" value="\K[^"]+' "${TMP_HTML}")
 
-# Step 3: Construct final download URL
-FINAL_URL="https://drive.usercontent.google.com/download?id=${FILE_ID}&export=download&confirm=${CONFIRM}&uuid=${UUID}"
+export FINAL_URL="https://drive.usercontent.google.com/download?id=${FILE_ID}&export=download&confirm=${CONFIRM}&uuid=${UUID}"
 
-# Step 4: Download the file
 wget --load-cookies /tmp/cookies.txt --no-check-certificate "$FINAL_URL" -O "${FILE_NAME}"
 
-# Clean up
 rm -f /tmp/cookies.txt "$TMP_HTML"
 
-# unzip and remove
 unzip longhistsquare100.zip && rm -f longhistsquare100.zip
 cd ..
 ```
@@ -136,31 +116,21 @@ We recommend that you download the data from the link and `scp` the ZIP onto you
 on the command line (note that this is dependent on the current system of Google verification, and can change):
 
 ```
-# assumes you are in base directory, not data/
-FILE_ID="1tSYyWg3HZbTtEhzpAXQpl28DSrWsXc7J"
-FILE_NAME="obs_encoders.zip"
-TMP_HTML="/tmp/gdrive_download.html"
+echo "assumes you are in base directory, not data/"
+export FILE_ID="1tSYyWg3HZbTtEhzpAXQpl28DSrWsXc7J" FILE_NAME="obs_encoders.zip" TMP_HTML="/tmp/gdrive_download.html"
 
-# Step 1: Get the interstitial download page
 wget --quiet --save-cookies /tmp/cookies.txt --keep-session-cookies --no-check-certificate \
 "https://drive.google.com/uc?export=download&id=${FILE_ID}" -O "${TMP_HTML}"
 
-# Step 2: Parse all required fields from the form
-UUID=$(grep -oP 'name="uuid" value="\K[^"]+' "${TMP_HTML}")
-CONFIRM=$(grep -oP 'name="confirm" value="\K[^"]+' "${TMP_HTML}")
-# Double check confirm fallback
-[ -z "$CONFIRM" ] && CONFIRM="t"
+export UUID=$(grep -oP 'name="uuid" value="\K[^"]+' "${TMP_HTML}")
+export CONFIRM=$(grep -oP 'name="confirm" value="\K[^"]+' "${TMP_HTML}")
 
-# Step 3: Construct final download URL
-FINAL_URL="https://drive.usercontent.google.com/download?id=${FILE_ID}&export=download&confirm=${CONFIRM}&uuid=${UUID}"
+export FINAL_URL="https://drive.usercontent.google.com/download?id=${FILE_ID}&export=download&confirm=${CONFIRM}&uuid=${UUID}"
 
-# Step 4: Download the file
 wget --load-cookies /tmp/cookies.txt --no-check-certificate "$FINAL_URL" -O "${FILE_NAME}"
 
-# Clean up
 rm -f /tmp/cookies.txt "$TMP_HTML"
 
-# unzip and remove
 unzip obs_encoders.zip && rm -f obs_encoders.zip
 ```
 
