@@ -346,6 +346,8 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             if not self.use_fourier_emb and noise_levels is not None:
                 noise_levels = noise_levels * self.noise_scheduler.config.num_train_timesteps
 
+        noise_levels = torch.cat([torch.zeros((noise_levels.shape[0], 1), device = self.device, dtype = torch.float32), noise_levels], dim = 1) # add a zero noise level for the timestep
+
         if self.use_flow_matching:
             timesteps = torch.linspace(
                 1,
@@ -643,18 +645,20 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         
         if self.hist_guidance.training.type == "random_independent":
             noise_levels = torch.rand((batch_size, To), device = self.device, dtype = torch.float32)
-            nobs_features = self._apply_noising(nobs_features, noise_levels) 
+            cond = self._apply_noising(cond, noise_levels) 
         elif self.hist_guidance.training.type == "random_uniform":
-                noise_levels = repeat(torch.rand((batch_size,), device = self.device, dtype = torch.float32), "b -> b t", t = hist_chunk_size)
-                nobs_features = self._apply_noising(nobs_features, noise_levels) 
+            noise_levels = repeat(torch.rand((batch_size,), device = self.device, dtype = torch.float32), "b -> b t", t = hist_chunk_size)
+            cond = self._apply_noising(cond, noise_levels) 
         elif self.hist_guidance.training.type == "binary_dropout":
             noise_levels = torch.bernoulli(0.5 * torch.ones((batch_size, To), device = self.device, dtype = torch.float32))
-            nobs_features = self._apply_noising(nobs_features, noise_levels) 
+            cond = self._apply_noising(cond, noise_levels) 
         elif self.hist_guidance.training.type == "fixed" or self.hist_guidance.training.type == "full":
             # don't use noise levels when doing fixed training
             noise_levels = None
         else:
             raise ValueError(f"Invalid hist_guidance training type: {self.hist_guidance.training.type}")
+        
+        noise_levels = torch.cat([torch.zeros((batch_size, 1), device = self.device, dtype = torch.float32), noise_levels], dim = 1) # add a zero noise level for the timestep
         
         # scale noise levels to match for fourier embedding
         if not self.use_fourier_emb and noise_levels is not None:
@@ -720,7 +724,8 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             pred = self.model(
                 noisy_trajectory,
                 timesteps,
-                cond
+                cond,
+                noise_levels
             )
             target = direction
         else:
@@ -736,7 +741,7 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
                 trajectory, noise, timesteps)
 
             # Predict the noise residual
-            pred = self.model(noisy_trajectory, timesteps, cond)
+            pred = self.model(noisy_trajectory, timesteps, cond, noise_levels)
 
             pred_type = self.noise_scheduler.config.prediction_type 
             if pred_type == 'epsilon':
@@ -775,7 +780,7 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
                 direction = noise - nobs_features
                 nobs_features = nobs_features + direction * noise_levels[:, :, None] # continuously "flow" towards the noise rather than adding noise
             else:
-                noise_timesteps = (noise_levels * self.noise_scheduler.config.num_train_timesteps).int()[:, :, None] # reshape to (B, T, 1)
+                noise_timesteps = (noise_levels * self.noise_scheduler.config.num_train_timesteps).long()[:, :, None] # reshape to (B, T, 1)
                 alphas_cumprod = self.noise_scheduler.alphas_cumprod.to(device=self.device)
                 sqrt_alpha_prod = alphas_cumprod[noise_timesteps] ** 0.5
                 sqrt_one_minus_alpha_prod = (1 - alphas_cumprod[noise_timesteps]) ** 0.5

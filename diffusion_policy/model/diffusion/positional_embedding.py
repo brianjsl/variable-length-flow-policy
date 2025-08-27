@@ -8,14 +8,23 @@ class SinusoidalPosEmb(nn.Module):
         super().__init__()
         self.dim = dim
 
-    def forward(self, x):
-        device = x.device
+    def forward(self, t):
+        """
+        t: [B, T]
+        returns: [B, T, D]
+        """
+        if t.ndim not in [1, 2]:
+            raise ValueError(f"Input t must be 1D or 2D, got {t.ndim} dimensions")
+
+        device = t.device
         half_dim = self.dim // 2
+
         emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
-        emb = x[:, None] * emb[None, :]
+        emb = torch.exp(torch.arange(half_dim, device=device, dtype = torch.float32) * -emb)
+        emb = t[..., None] * emb
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
         return emb
+    
 
 class FourierEmbedding(torch.nn.Module):
     """

@@ -420,10 +420,10 @@ class TransformerForDiffusion(ModuleAttrMixin):
             timesteps = torch.tensor([timesteps], dtype=torch.long, device=sample.device)
         elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:
             timesteps = timesteps[None].to(sample.device)
-        # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+
+        # broadcast to (B, T)
         timesteps = timesteps.expand(sample.shape[0])
-        time_emb = self.time_emb(timesteps).unsqueeze(1)
-        # (B,1,n_emb)
+        time_emb = self.time_emb(timesteps).unsqueeze(1)  # (B,1,n_emb)
 
         if noise_levels is not None:
             noise_levels = self.time_emb(noise_levels)
