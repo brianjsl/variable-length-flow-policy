@@ -37,7 +37,8 @@ logging:
   id: null
   mode: online
   name: ptp_aloha_embed
-  project: diffusion_aloha
+  project: robomimic_history_guided
+  entity: tri
   resume: true
   tags:
   - train_diffusion_transformer_hybrid
@@ -50,7 +51,6 @@ n_action_steps: ${global_action}
 n_latency_steps: 0
 n_obs_steps: ${global_obs}
 name: train_diffusion_transformer_hybrid
-obs_as_cond: true
 optimizer:
   betas:
   - 0.9
@@ -88,7 +88,6 @@ policy:
     prediction_type: epsilon
     variance_type: fixed_small
   num_inference_steps: 100
-  obs_as_cond: true
   obs_encoder_group_norm: true
   p_drop_attn: 0.3
   p_drop_emb: 0.0
@@ -112,7 +111,21 @@ policy:
         - 84
         - 84
         type: rgb
-  time_as_cond: true
+  use_flow_matching: false
+  fm_tsampler: "uniform" # only used if flow is used.
+  use_fourier_emb: false
+  train_diffusion_n_samples: 8
+  input_pertub: 0
+  hist_guidance:
+    sampling:
+      type: fixed #average, fixed, fixed_stabilization, full
+      hist_len: [FULL]
+      weights: [1] # only used if type is average
+      stabilization_level: 0.1 # only used if type is fixed_stabilization
+    training:
+      type: full # random_independent, random_uniform, binary_dropout, fixed, full
+      training_length: FULL
+
 shape_meta:
   action:
     shape:
@@ -133,6 +146,7 @@ shape_meta:
       - 84
       - 84
       type: rgb
+
 task:
   abs_action: false
   dataset:

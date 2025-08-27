@@ -50,7 +50,6 @@ n_action_steps: ${global_action}
 n_latency_steps: 0
 n_obs_steps: ${global_obs}
 name: train_diffusion_transformer_hybrid
-obs_as_cond: true
 optimizer:
   betas:
   - 0.9
@@ -88,7 +87,6 @@ policy:
     prediction_type: epsilon
     variance_type: fixed_small
   num_inference_steps: 100
-  obs_as_cond: true
   obs_encoder_group_norm: true
   p_drop_attn: 0.3
   p_drop_emb: 0.0
@@ -118,7 +116,6 @@ policy:
       robot0_gripper_qpos:
         shape:
         - 2
-  time_as_cond: true
 shape_meta:
   action:
     shape:
@@ -145,6 +142,22 @@ shape_meta:
     robot0_gripper_qpos:
       shape:
       - 2
+
+use_flow_matching: False
+fm_tsampler: "uniform" # only used if flow is used.
+use_fourier_emb: False
+train_diffusion_n_samples: 8
+input_perturbation: 0
+hist_guidance:
+  sampling:
+    type: fixed #average, fixed, fixed_stabilization
+    hist_len: []
+    weights: [1] # only used if type is average
+    stabilization_level: 0.1 # only used if type is fixed_stabilization
+  training:
+    type: fixed # random_independent, random_uniform, binary_dropout, fixed, full
+    training_length: FULL
+
 task:
   abs_action: true
   dataset:

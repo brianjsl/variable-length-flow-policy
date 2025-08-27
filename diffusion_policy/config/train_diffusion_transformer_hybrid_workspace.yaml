@@ -16,7 +16,6 @@ n_latency_steps: 0
 dataset_obs_steps: ${n_obs_steps}
 past_action_visible: False
 keypoint_visible_rate: 1.0
-obs_as_cond: True
 
 policy:
   _target_: diffusion_policy.policy.diffusion_transformer_hybrid_image_policy.DiffusionTransformerHybridImagePolicy
@@ -49,8 +48,21 @@ policy:
   p_drop_emb: 0.0
   p_drop_attn: 0.3
   causal_attn: True
-  time_as_cond: True # if false, use BERT like encoder only arch, time as input
-  obs_as_cond: ${obs_as_cond}
+
+  use_flow_matching: False
+  fm_tsampler: "uniform" # only used if flow is used.
+  use_fourier_emb: False
+  train_diffusion_n_samples: 8
+  input_pertub: 0
+  hist_guidance:
+    sampling:
+      type: fixed #average, fixed, fixed_stabilization
+      hist_len: []
+      weights: [1] # only used if type is average
+      stabilization_level: 0.1 # only used if type is fixed_stabilization
+    training:
+      type: full # random_independent, random_uniform, binary_dropout, fixed, full
+      training_length: FULL
 
   # scheduler.step params
   # predict_epsilon: True

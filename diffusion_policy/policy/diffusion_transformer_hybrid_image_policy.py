@@ -21,7 +21,7 @@ import diffusion_policy.model.vision.crop_randomizer as dmvc
 from diffusion_policy.common.pytorch_util import dict_apply, replace_submodules
 import wandb
 import numpy as np
-
+import omegaconf
 
 def dct_2d(x):
     """
@@ -67,17 +67,18 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
     def __init__(self, 
             shape_meta: dict,
             noise_scheduler: DDPMScheduler,
-            # task params
             horizon, 
             n_action_steps, 
             n_obs_steps,
+            use_flow_matching: bool = False,
+            input_pertub: float = 0,
+            fm_tsampler: str = "uniform", 
             num_inference_steps=None,
+            train_diffusion_n_samples: int = 1,
             use_embed_if_present=True,
-            # image
             crop_shape=(76, 76),
             obs_encoder_group_norm=False,
             eval_fixed_crop=False,
-            # arch
             n_layer=8,
             n_cond_layers=0,
             n_head=4,
@@ -85,20 +86,30 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             p_drop_emb=0.0,
             p_drop_attn=0.3,
             causal_attn=True,
-            time_as_cond=True,
-            obs_as_cond=True,
             pred_action_steps_only=False,
-            # parameters passed to step
             past_action_pred=False,
             obs_encoder_dir=None,
             obs_encoder_freeze=False,
             past_steps_reg=-1,
+            hist_guidance: Optional[omegaconf.DictConfig] = None,
+            use_fourier_emb: bool = False,
             **kwargs):
         super().__init__()
+
+        self.use_flow_matching = use_flow_matching
+        self.fm_tsampler = fm_tsampler
+        self.input_pertub = input_pertub
+        self.hist_guidance = hist_guidance
+
+        if self.fm_tsampler == "beta":
+            # Following https://arxiv.org/abs/2410.24164 pi-0 Appendix B
+            # to upsample timesteps near 1 (high noise level).
+            self.tsampler = torch.distributions.beta.Beta(1.5, 1.0)
 
         self.past_action_pred = past_action_pred
         self.use_embed_if_present = use_embed_if_present
         self.past_steps_reg = past_steps_reg
+
         # parse shape_meta
         action_shape = shape_meta['action']['shape']
         assert len(action_shape) == 1
@@ -187,9 +198,9 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
 
         # create diffusion model
         obs_feature_dim = obs_encoder.output_shape()[0]
-        input_dim = action_dim if obs_as_cond else (obs_feature_dim + action_dim)
+        input_dim = action_dim
         output_dim = input_dim
-        cond_dim = obs_feature_dim if obs_as_cond else 0
+        cond_dim = obs_feature_dim
 
         model = TransformerForDiffusion(
             input_dim=input_dim,
@@ -203,17 +214,17 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             p_drop_emb=p_drop_emb,
             p_drop_attn=p_drop_attn,
             causal_attn=causal_attn,
-            time_as_cond=time_as_cond,
-            obs_as_cond=obs_as_cond,
-            n_cond_layers=n_cond_layers
+            n_cond_layers=n_cond_layers,
+            use_fourier_emb = use_fourier_emb
         )
 
         self.obs_encoder = obs_encoder
         self.model = model
         self.noise_scheduler = noise_scheduler
+        self.use_fourier_emb = use_fourier_emb # for flow
         self.mask_generator = LowdimMaskGenerator(
             action_dim=action_dim,
-            obs_dim=0 if (obs_as_cond) else obs_feature_dim,
+            obs_dim=0,
             max_n_obs_steps=n_obs_steps,
             fix_obs_steps=True,
             action_visible=False
@@ -224,7 +235,6 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         self.action_dim = action_dim
         self.n_action_steps = n_action_steps
         self.n_obs_steps = n_obs_steps
-        self.obs_as_cond = obs_as_cond
         self.pred_action_steps_only = pred_action_steps_only
         self.kwargs = kwargs
 
@@ -247,45 +257,180 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
 
         if num_inference_steps is None:
             num_inference_steps = noise_scheduler.config.num_train_timesteps
+
         self.num_inference_steps = num_inference_steps
+        self.train_diffusion_n_samples = train_diffusion_n_samples
+
+        if self.hist_guidance.training.type == "random_independent":
+            print(f"Training with random independent history length")
+        elif self.hist_guidance.training.type == "binary_dropout":
+            print(f"Training with binary dropout history length")
+        elif self.hist_guidance.training.type == "fixed":
+            print(f"Training with fixed history length: {self.hist_guidance.training.training_length if self.hist_guidance.training.training_length != 'FULL' else self.n_obs_steps}")
+        elif self.hist_guidance.training.type == "full":
+            print(f"Training with full history length")
+        else:
+            raise ValueError(f"Invalid hist_guidance training type: {self.hist_guidance.training.type}")
+
+        if self.hist_guidance.sampling.type == "fixed" or self.hist_guidance.sampling.type == "fixed_stabilization" or self.hist_guidance.sampling.type == "pyramid":
+            print(f"Sampling with fixed history length: {self.hist_guidance.sampling.hist_len}")
+        elif self.hist_guidance.sampling.type == "average": 
+            print(f"Sampling with history lengths averaged between {self.hist_guidance.sampling.hist_len} with weights {self.hist_guidance.sampling.weights}")
+            assert self.hist_guidance.sampling.weights is not None
+        elif self.hist_guidance.sampling.type == "full":
+            print(f"Sampling with full history length")
+        elif self.hist_guidance.sampling.type == "argmin":
+            print(f"Sampling with full history length and {self.hist_guidance.sampling.n_samples} samples")
+            assert self.hist_guidance.sampling.n_samples is not None
+        elif self.hist_guidance.sampling.type == "dynamic":
+            assert self.hist_guidance.training.type == "random_independent" or self.hist_guidance.training.type == "binary_dropout"
+            assert self.hist_guidance.sampling.n_samples is not None
+            print(f"Sampling with dynamic history length")
+        else:
+            raise ValueError(f"Invalid hist_guidance sampling type: {self.hist_guidance.sampling.type}")
     
     # ========= inference  ============
     def conditional_sample(self, 
-            condition_data, condition_mask,
-            cond=None, generator=None, act=None,
+            shape,
+            cond=None, 
+            generator=None, 
+            obs_mask = None,
+            hist_len = None,
             # keyword arguments to scheduler.step
             **kwargs
             ):
         model = self.model
         scheduler = self.noise_scheduler
+        B, T, D = shape
 
+        if self.hist_guidance.sampling.type == "argmin":
+            bsz = B * self.hist_guidance.sampling.n_samples
+        elif self.hist_guidance.sampling.type == "dynamic":
+            bsz = B * (self.hist_guidance.sampling.n_samples + 1)
+        else:
+            bsz = B
+        
         trajectory = torch.randn(
-            size=condition_data.shape, 
-            dtype=condition_data.dtype,
-            device=condition_data.device,
+            size=(bsz, T, D), 
+            dtype=cond.dtype,
+            device=cond.device,
             generator=generator)
-    
-        # set step values
-        scheduler.set_timesteps(self.num_inference_steps)
+        
+        if self.hist_guidance.training.type == "random_independent" or self.hist_guidance.training.type == "binary_dropout":
+            if self.hist_guidance.sampling.type == "pyramid":
+                noise_levels = self._generate_pyramid_scheduling_matrix(B * len(hist_len), self.hist_guidance.sampling.max_noise_level, self.n_obs_steps)
+            else:
+                noise_levels = torch.zeros(B * len(hist_len), self.n_obs_steps, device = self.device) 
+        else:
+            noise_levels = None
+        
+        flattened_obs_mask = obs_mask.view(-1, *obs_mask.shape[2:])
 
-        for t in scheduler.timesteps:
-            # 1. apply conditioning
-            trajectory[condition_mask] = condition_data[condition_mask]
-            if act is not None:
-                trajectory[:,:act.shape[1]] = act   
+        if self.hist_guidance.training.type == "random_independent" or self.hist_guidance.training.type == "binary_dropout":
+            if hasattr(self.hist_guidance.sampling, "mask_level"): 
+                noise_levels[~flattened_obs_mask] = self.hist_guidance.sampling.mask_level # unpredicted tokens are set to "full noise"
+            else:
+                noise_levels[~flattened_obs_mask] = 1.0 # unpredicted tokens are set to "full noise"
+        
+        cond = cond.view(-1, *cond.shape[2:])
 
-            # 2. predict model output
-            model_output = model(trajectory, t, cond)
+        # noise as masking
+        if self.hist_guidance.training.type == "random_independent" or self.hist_guidance.training.type == "binary_dropout":
+            cond = self._apply_noising(cond, noise_levels)
 
-            # 3. compute previous image: x_t -> x_t-1
-            trajectory = scheduler.step(
-                model_output, t, trajectory, 
-                generator=generator,
-                **kwargs
+        # for stabilization we just set the noise level to the stabilization level for the predicted tokens (no actual noising)
+
+        if self.hist_guidance.training.type == "random_independent" or self.hist_guidance.training.type == "binary_dropout":
+            if self.hist_guidance.sampling.type == "fixed_stabilization":
+                noise_levels[flattened_obs_mask] = self.hist_guidance.sampling.stabilization_level
+            if not self.use_fourier_emb and noise_levels is not None:
+                noise_levels = noise_levels * self.noise_scheduler.config.num_train_timesteps
+
+        if self.use_flow_matching:
+            timesteps = torch.linspace(
+                1,
+                0,
+                self.num_inference_steps + 1,
+                device = self.device
+            )[:-1]
+
+            for t in timesteps:
+                if not self.use_fourier_emb:
+                    t = (
+                        t * self.noise_scheduler.config.num_train_timesteps
+                    ).float()
+
+                actions = trajectory
+
+                if self.hist_guidance.sampling.type not in ["dynamic"]:
+                    actions = actions.repeat(len(hist_len), 1, 1)
+
+                model_output = model(
+                    trajectory,
+                    t,
+                    cond,
+                    noise_levels
+                )
+
+                if self.hist_guidance.sampling.type == "average":
+                    weights = torch.tensor(self.hist_guidance.sampling.weights, device=trajectory.device) # (len(hist_len),)
+                    weights = weights / weights.sum()
+                else:
+                    weights = torch.tensor([1.], device=trajectory.device)
+
+                if self.hist_guidance.sampling.type != "dynamic":
+                    model_output = model_output.view(B, len(hist_len), *model_output.shape[1:]) # (B, len(hist_len), Ta, D)
+                    weights = weights[None, :, None].repeat(1, 1, T) 
+                    weights = weights / weights.sum(dim = 1, keepdim = True)
+                    dim_diff = model_output.ndim - weights.ndim
+                    weights = weights.view(*weights.shape, *([1] * dim_diff))
+                    model_output = (model_output * weights).sum(dim=1)
+
+                trajectory = (
+                    trajectory - model_output / self.num_inference_steps
+                )
+        else:
+            # set step values
+            scheduler.set_timesteps(self.num_inference_steps)
+
+            for t in scheduler.timesteps:
+                timesteps = t.to(trajectory.device)
+
+                if self.use_fourier_emb:
+                    timesteps = timesteps / self.noise_scheduler.config.num_train_timesteps
+                
+                if self.hist_guidance.sampling.type not in ["dynamic"]:
+                    trajectory= trajectory.repeat(len(hist_len), 1, 1)
+
+                model_output = model(trajectory, timesteps, cond, noise_levels)
+
+                if self.hist_guidance.sampling.type == "average":
+                    weights = torch.tensor(self.hist_guidance.sampling.weights, device=trajectory.device) # (len(hist_len),)
+                    weights = weights / weights.sum()
+                else:
+                    weights = torch.tensor([1.], device=trajectory.device)
+
+                if self.hist_guidance.sampling.type != "dynamic":
+                    model_output = model_output.view(B, len(hist_len), *model_output.shape[1:]) # (B, len(hist_len), Ta, D)
+                    weights = weights[None, :, None].repeat(1, 1, T)
+                    weights = weights / weights.sum(dim = 1, keepdim = True)
+                    dim_diff = model_output.ndim - weights.ndim
+                    weights = weights.view(*weights.shape, *([1] * dim_diff))
+                    model_output = (model_output * weights).sum(dim=1)
+
+                trajectory = scheduler.step(
+                    model_output, t, trajectory, 
+                    generator=generator,
+                    **kwargs
                 ).prev_sample
         
-        # finally make sure conditioning is enforced
-        trajectory[condition_mask] = condition_data[condition_mask]        
+        if self.hist_guidance.sampling.type == "dynamic":
+            trajectory = trajectory.view(len(hist_len), B, *trajectory.shape[1:])
+            full_trajectory = trajectory[-1].unsqueeze(0).repeat(len(hist_len) - 1, 1, 1, 1)
+            trajectory = trajectory[:-1]
+            l2_loss = F.mse_loss(trajectory, full_trajectory, reduction="none").mean(dim = (1,2,3))
+            best_idx = l2_loss.argmin(dim = 0)
+            trajectory = trajectory[best_idx]
 
         return trajectory
 
@@ -364,7 +509,7 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         return cond
 
 
-    def predict_action(self, obs_dict: Dict[str, torch.Tensor], act_cond: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+    def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
         obs_dict: must include "obs" key
         result: must include "action" key
@@ -372,8 +517,10 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         assert 'past_action' not in obs_dict # not implemented yet
         # normalize input
         nobs = self.normalizer.normalize(obs_dict)
+
         if "embedding" in obs_dict:
             nobs["embedding"] = obs_dict["embedding"]
+
         value = next(iter(nobs.values()))
         B, To = value.shape[:2]
         T = self.horizon
@@ -385,45 +532,49 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         device = self.device
         dtype = self.dtype
 
+        if self.hist_guidance.sampling.type == "fixed" or self.hist_guidance.sampling.type == "fixed_stabilization" or self.hist_guidance.sampling.type == "pyramid":
+            assert len(self.hist_guidance.sampling.hist_len) == 1
+            hl = self.hist_guidance.sampling.hist_len[0]
+            hist_len = [hl if hl != "FULL" else self.n_obs_steps]
+        elif self.hist_guidance.sampling.type == "average" or self.hist_guidance.sampling.type == "argmin":
+            hist_len = []
+            for l in self.hist_guidance.sampling.hist_len:
+                if l == "FULL":
+                    hist_len.append(self.n_obs_steps)
+                else:
+                    hist_len.append(l)
+        elif self.hist_guidance.sampling.type == "full":
+            hist_len = [self.n_obs_steps] # for dynamic we change it later
+        elif self.hist_guidance.sampling.type == "dynamic":
+                assert len(self.hist_guidance.sampling.hist_len) == 1
+                hl = self.hist_guidance.sampling.hist_len[0]
+                hist_len = [hl] * self.hist_guidance.sampling.n_samples + [self.n_obs_steps]
+        else:
+            raise ValueError(f"Invalid hist_guidance sampling type: {self.hist_guidance.sampling.type}")
 
         # handle different ways of passing observation
-        cond = None
-        cond_data = None
-        cond_mask = None
-        if self.obs_as_cond:
-            if self.use_embed_if_present and "embedding" in obs_dict:
-                cond = obs_dict["embedding"]
-            else:
-                this_nobs = dict_apply(nobs, lambda x: x[:,:To,...].reshape(-1,*x.shape[2:]))
-                nobs_features = self.obs_encoder(this_nobs)
-                # reshape back to B, To, Do
-                cond = nobs_features.reshape(B, To, -1)
-            shape = (B, T, Da)
-            if self.pred_action_steps_only:
-                shape = (B, self.n_action_steps, Da)
-            cond_data = torch.zeros(size=shape, device=device, dtype=dtype)
-            cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
+        if self.use_embed_if_present and "embedding" in obs_dict:
+            cond = obs_dict["embedding"]
         else:
-            # condition through impainting
             this_nobs = dict_apply(nobs, lambda x: x[:,:To,...].reshape(-1,*x.shape[2:]))
             nobs_features = self.obs_encoder(this_nobs)
             # reshape back to B, To, Do
-            nobs_features = nobs_features.reshape(B, To, -1)
-            shape = (B, T, Da+Do)
-            cond_data = torch.zeros(size=shape, device=device, dtype=dtype)
-            cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
-            cond_data[:,:To,Da:] = nobs_features
-            cond_mask[:,:To,Da:] = True
+            cond = nobs_features.reshape(B, To, -1)
+        shape = (B, T, Da)
+        if self.pred_action_steps_only:
+            shape = (B, self.n_action_steps, Da)
 
-        if act_cond is not None:
-            act_cond = self.normalizer['action'].normalize(act_cond)
+        obs_mask = torch.zeros((B, len(hist_len), To), device = device, dtype = torch.bool)
+        cond = cond.unsqueeze(1).repeat(1, len(hist_len), 1, 1)
+        for i, c in enumerate(hist_len):
+            obs_mask[:,i,-c:] = True
 
         # run sampling
         nsample = self.conditional_sample(
-            cond_data, 
-            cond_mask,
+            shape=shape,
             cond=cond,
-            act=act_cond,
+            obs_mask = obs_mask,
+            hist_len = hist_len,
             **self.kwargs)
         
         # unnormalize prediction
@@ -467,94 +618,166 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         return optimizer
 
     def compute_loss(self, batch, debug=False):
+
         # normalize input
         assert 'valid_mask' not in batch
         nobs = self.normalizer.normalize(batch['obs'])
         nactions = self.normalizer['action'].normalize(batch['action'])
+
         batch_size = nactions.shape[0]
         horizon = nactions.shape[1]
         To = self.n_obs_steps
 
-        # handle different ways of passing observation
-        cond = None
         trajectory = nactions
-        if self.obs_as_cond:
-            # reshape B, T, ... to B*T
-            if self.use_embed_if_present and "embedding" in batch["obs"]:
-                cond = batch["obs"]["embedding"]
-            else:
-                this_nobs = dict_apply(nobs, 
-                    lambda x: x[:,:To,...].reshape(-1,*x.shape[2:]))
-                nobs_features = self.obs_encoder(this_nobs)
-                # reshape back to B, T, Do
-                cond = nobs_features.reshape(batch_size, To, -1)
-            if self.pred_action_steps_only:
-                start = To - 1
-                end = start + self.n_action_steps
-                trajectory = nactions[:,start:end]
+        if self.use_embed_if_present and "embedding" in batch["obs"]:
+            cond = batch["obs"]["embedding"]
         else:
-            # reshape B, T, ... to B*T
-            this_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))
+            this_nobs = dict_apply(nobs, 
+                lambda x: x[:,:To,...].reshape(-1,*x.shape[2:]))
             nobs_features = self.obs_encoder(this_nobs)
-            # reshape back to B, T, Do
-            nobs_features = nobs_features.reshape(batch_size, horizon, -1)
-            trajectory = torch.cat([nactions, nobs_features], dim=-1).detach()
-
-        # generate impainting mask
+            cond = nobs_features.reshape(batch_size, To, -1)
         if self.pred_action_steps_only:
-            condition_mask = torch.zeros_like(trajectory, dtype=torch.bool)
+            start = To - 1
+            end = start + self.n_action_steps
+            trajectory = nactions[:,start:end]
+        
+        if self.hist_guidance.training.type == "random_independent":
+            noise_levels = torch.rand((batch_size, To), device = self.device, dtype = torch.float32)
+            nobs_features = self._apply_noising(nobs_features, noise_levels) 
+        elif self.hist_guidance.training.type == "random_uniform":
+                noise_levels = repeat(torch.rand((batch_size,), device = self.device, dtype = torch.float32), "b -> b t", t = hist_chunk_size)
+                nobs_features = self._apply_noising(nobs_features, noise_levels) 
+        elif self.hist_guidance.training.type == "binary_dropout":
+            noise_levels = torch.bernoulli(0.5 * torch.ones((batch_size, To), device = self.device, dtype = torch.float32))
+            nobs_features = self._apply_noising(nobs_features, noise_levels) 
+        elif self.hist_guidance.training.type == "fixed" or self.hist_guidance.training.type == "full":
+            # don't use noise levels when doing fixed training
+            noise_levels = None
         else:
-            condition_mask = self.mask_generator(trajectory.shape)
+            raise ValueError(f"Invalid hist_guidance training type: {self.hist_guidance.training.type}")
+        
+        # scale noise levels to match for fourier embedding
+        if not self.use_fourier_emb and noise_levels is not None:
+            noise_levels = noise_levels * self.noise_scheduler.config.num_train_timesteps
+
+        # train on multiple diffusion samples per obs, basically sampling
+        # multiple noise levels.
+        # NOTE: This increases the 'effective' batch-size, so batch_size != bsz
+        if self.train_diffusion_n_samples != 1:
+            def _repeat(x):
+                return torch.repeat_interleave(
+                    x, repeats=self.train_diffusion_n_samples, dim=0
+                )
+
+            cond = _repeat(cond)
+            trajectory = _repeat(trajectory)
+            if noise_levels is not None:
+                noise_levels = _repeat(noise_levels)
+
+        B_repeated = trajectory.shape[0] 
 
         # Sample noise that we'll add to the images
         noise = torch.randn(trajectory.shape, device=trajectory.device)
-        bsz = trajectory.shape[0]
-        # Sample a random timestep for each image
-        timesteps = torch.randint(
-            0, self.noise_scheduler.config.num_train_timesteps, 
-            (bsz,), device=trajectory.device
-        ).long()
-        # Add noise to the clean images according to the noise magnitude at each timestep
-        # (this is the forward diffusion process)
-        noisy_trajectory = self.noise_scheduler.add_noise(
-            trajectory, noise, timesteps)
 
-        # compute loss mask
-        loss_mask = ~condition_mask
+        # input perturbation by adding additonal noise to alleviate exposure
+        # bias reference: https://github.com/forever208/DDPM-IP
+        if self.input_pertub != 0:
+            noise = noise + self.input_pertub * torch.randn(
+                trajectory.shape, device=trajectory.device
+            )
 
-        # apply conditioning
-        noisy_trajectory[condition_mask] = trajectory[condition_mask]
-        
-        # Predict the noise residual
-        pred = self.model(noisy_trajectory, timesteps, cond)
+        if self.use_flow_matching:
+            # This is the original flow matching training objective with
+            # standard Gaussian prior to approximate direction with model
+            # output
 
-        pred_type = self.noise_scheduler.config.prediction_type 
-        if pred_type == 'epsilon':
-            target = noise
-        elif pred_type == 'sample':
-            target = trajectory
+            # Sample a random timestep for each image
+            if self.fm_tsampler == "uniform":
+                timestamps = torch.rand(
+                    (B_repeated,), device=trajectory.device
+                )
+            elif self.fm_tsampler == "beta":
+                timestamps = self.tsampler.sample((B_repeated,))
+                timestamps = timestamps.to(trajectory.device)
+            else:
+                raise ValueError(f"Invalid tsampler: {self.fm_tsampler}")
+            
+            cont_t = timestamps.view(-1, *([1] * (noise.dim() - 1)))
+
+            if self.use_fourier_emb:
+                timesteps = timestamps.float()
+            else:
+                timesteps = (
+                    timestamps * self.noise_scheduler.config.num_train_timesteps
+                ).float()
+
+            # Flow step: x0 -> x1
+            x0, x1 = trajectory, noise
+            direction = x1 - x0
+            noisy_trajectory = x0 + cont_t * direction
+
+            # for flow, the prediction type is always the velocity field
+            pred = self.model(
+                noisy_trajectory,
+                timesteps,
+                cond
+            )
+            target = direction
         else:
-            raise ValueError(f"Unsupported prediction type {pred_type}")
+            # Sample a random timestep for each image
+            timesteps = torch.randint(
+                0, self.noise_scheduler.config.num_train_timesteps, 
+                (B_repeated,), device=trajectory.device
+            ).long()
 
-        # val = self.horizon - self.n_obs_steps
+            # Add noise to the clean images according to the noise magnitude at each timestep
+            # (this is the forward diffusion process)
+            noisy_trajectory = self.noise_scheduler.add_noise(
+                trajectory, noise, timesteps)
+
+            # Predict the noise residual
+            pred = self.model(noisy_trajectory, timesteps, cond)
+
+            pred_type = self.noise_scheduler.config.prediction_type 
+            if pred_type == 'epsilon':
+                target = noise
+            elif pred_type == 'sample':
+                target = trajectory
+            else:
+                raise ValueError(f"Unsupported prediction type {pred_type}")
+
         if not self.past_action_pred:
-            # val = self.horizon - self.n_obs_steps
             pred = pred[:, self.n_obs_steps-1:]
             if debug:
                 print(pred.shape[1], target.shape[1])
             target = target[:, self.n_obs_steps-1:]
-            loss_mask = loss_mask[:, self.n_obs_steps-1:]
         if self.past_steps_reg != -1:
             # print(self.n_obs_steps, self.past_steps_reg)
             assert self.n_obs_steps - self.past_steps_reg - 1 > 0
             pred = pred[:, self.n_obs_steps - self.past_steps_reg - 1:]
             # print(pred.shape)
-            # breakpoint()
             target = target[:, self.n_obs_steps - self.past_steps_reg - 1:]
-            loss_mask = loss_mask[:, self.n_obs_steps - self.past_steps_reg - 1:]
 
         loss = F.mse_loss(pred, target, reduction='none')
-        loss = loss * loss_mask.type(loss.dtype)
         loss = reduce(loss, 'b ... -> b (...)', 'mean')
         loss = loss.mean()
         return loss
+    
+    def _apply_noising(self, nobs_features, noise_levels):
+            """
+            Applies noising to the observation features.
+            """
+            assert noise_levels.shape == nobs_features.shape[:2]
+
+            noise = torch.randn_like(nobs_features)
+
+            if self.use_flow_matching:
+                direction = noise - nobs_features
+                nobs_features = nobs_features + direction * noise_levels[:, :, None] # continuously "flow" towards the noise rather than adding noise
+            else:
+                noise_timesteps = (noise_levels * self.noise_scheduler.config.num_train_timesteps).int()[:, :, None] # reshape to (B, T, 1)
+                alphas_cumprod = self.noise_scheduler.alphas_cumprod.to(device=self.device)
+                sqrt_alpha_prod = alphas_cumprod[noise_timesteps] ** 0.5
+                sqrt_one_minus_alpha_prod = (1 - alphas_cumprod[noise_timesteps]) ** 0.5
+                nobs_features = sqrt_alpha_prod * nobs_features + sqrt_one_minus_alpha_prod * noise
+            return nobs_features

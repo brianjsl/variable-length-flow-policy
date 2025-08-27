@@ -10,9 +10,12 @@ if __name__ == "__main__":
 import os
 import hydra
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from omegaconf import OmegaConf
 import pathlib
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 import copy
 import random
 import wandb
@@ -60,6 +63,14 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
     def run(self):
         cfg = copy.deepcopy(self.cfg)
 
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        is_distributed = world_size > 1
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        if is_distributed and not dist.is_initialized():
+            dist.init_process_group(backend="nccl")
+            torch.cuda.set_device(local_rank)
+        is_main_process = (not is_distributed) or (dist.get_rank() == 0)
+
         # resume training
         if cfg.training.resume:
             lastest_ckpt_path = self.get_checkpoint_path()
@@ -72,7 +83,23 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
         dataset = hydra.utils.instantiate(cfg.task.dataset)
         assert isinstance(dataset, BaseImageDataset)
         dataset.__getitem__(0)
-        train_dataloader = DataLoader(dataset, **cfg.dataloader)
+        # distributed sampler for training
+        train_sampler = None
+        if is_distributed:
+            train_sampler = DistributedSampler(dataset, shuffle=True)
+
+        if train_sampler is not None:
+            train_dataloader = DataLoader(
+                dataset,
+                batch_size=cfg.dataloader.batch_size,
+                num_workers=cfg.dataloader.num_workers,
+                shuffle=False,
+                pin_memory=cfg.dataloader.pin_memory,
+                persistent_workers=cfg.dataloader.persistent_workers,
+                sampler=train_sampler,
+            )
+        else:
+            train_dataloader = DataLoader(dataset, **cfg.dataloader)
         normalizer = dataset.get_normalizer()
 
         # configure validation dataset
@@ -123,17 +150,19 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
                 output_dir=self.output_dir)
             assert isinstance(env_runner, BaseImageRunner)
 
-        # configure logging
-        wandb_run = wandb.init(
-            dir=str(self.output_dir),
-            config=OmegaConf.to_container(cfg, resolve=True),
-            **cfg.logging
-        )
-        wandb.config.update(
-            {
-                "output_dir": self.output_dir,
-            }
-        )
+        # configure logging (rank 0 only)
+        wandb_run = None
+        if is_main_process:
+            wandb_run = wandb.init(
+                dir=str(self.output_dir),
+                config=OmegaConf.to_container(cfg, resolve=True),
+                **cfg.logging
+            )
+            wandb.config.update(
+                {
+                    "output_dir": self.output_dir,
+                }
+            )
 
         # configure checkpoint
         topk_manager = TopKCheckpointManager(
@@ -142,11 +171,14 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
         )
 
         # device transfer
-        device = torch.device(cfg.training.device)
+        device = torch.device(f"cuda:{local_rank}") if is_distributed else torch.device(cfg.training.device)
         self.model.to(device)
         if self.ema_model is not None:
             self.ema_model.to(device)
         optimizer_to(self.optimizer, device)
+        # wrap model with DDP
+        if is_distributed:
+            self.model = DDP(self.model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
         
         # save batch for sampling
         train_sampling_batch = None
@@ -154,21 +186,34 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
         # training loop
         debug = True
         log_path = os.path.join(self.output_dir, 'logs.json.txt')
-        with JsonLogger(log_path) as json_logger:
+        # rank-aware logger context
+        class _NoOpJsonLogger:
+            def __enter__(self):
+                return self
+            def __exit__(self, exc_type, exc, tb):
+                return False
+            def log(self, *args, **kwargs):
+                pass
+
+        json_logger_ctx = JsonLogger(log_path) if is_main_process else _NoOpJsonLogger()
+        with json_logger_ctx as json_logger:
             for local_epoch_idx in range(cfg.training.num_epochs):
+                if is_distributed and train_sampler is not None:
+                    train_sampler.set_epoch(self.epoch)
                 step_log = dict()
                 # ========= train for this epoch ==========
                 train_losses = list()
-                with tqdm.tqdm(train_dataloader, desc=f"Training epoch {self.epoch}", 
-                        leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
-                    for batch_idx, batch in enumerate(tepoch):
+                data_iter = tqdm.tqdm(train_dataloader, desc=f"Training epoch {self.epoch}", 
+                        leave=False, mininterval=cfg.training.tqdm_interval_sec) if is_main_process else train_dataloader
+                for batch_idx, batch in enumerate(data_iter):
                         # device transfer
                         batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
                         if train_sampling_batch is None:
                             train_sampling_batch = batch
                         
-                        # compute loss
-                        raw_loss = self.model.compute_loss(batch, debug)
+                        # compute loss (unwrap DDP for custom methods)
+                        model_for_loss = self.model.module if isinstance(self.model, DDP) else self.model
+                        raw_loss = model_for_loss.compute_loss(batch, debug)
                         debug = False
                         loss = raw_loss / cfg.training.gradient_accumulate_every
                         loss.backward()
@@ -180,12 +225,17 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
                             lr_scheduler.step()
                         
                         # update ema
-                        if cfg.training.use_ema:
-                            ema.step(self.model)
+                        if cfg.training.use_ema and is_main_process:
+                            ema_model_input = self.model.module if isinstance(self.model, DDP) else self.model
+                            ema.step(ema_model_input)
 
                         # logging
                         raw_loss_cpu = raw_loss.item()
-                        tepoch.set_postfix(loss=raw_loss_cpu, refresh=False)
+                        if is_main_process:
+                            try:
+                                data_iter.set_postfix(loss=raw_loss_cpu, refresh=False)  # type: ignore
+                            except Exception:
+                                pass
                         train_losses.append(raw_loss_cpu)
                         step_log = {
                             'train_loss': raw_loss_cpu,
@@ -195,9 +245,10 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
                         }
 
                         is_last_batch = (batch_idx == (len(train_dataloader)-1))
-                        if not is_last_batch:
+                        if not is_last_batch and is_main_process:
                             # log of last step is combined with validation and rollout
-                            wandb_run.log(step_log)
+                            if wandb_run is not None:
+                                wandb_run.log(step_log)
                             json_logger.log(step_log)
                             self.global_step += 1
 
@@ -217,20 +268,21 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
                 policy.eval()
 
                 # run rollout
-                if ((self.epoch + 1) % cfg.training.rollout_every) == 0 and env_runner is not None:
+                if is_main_process and ((self.epoch + 1) % cfg.training.rollout_every) == 0 and env_runner is not None:
                     runner_log = env_runner.run(policy)
                     # log all
                     step_log.update(runner_log)
 
                 # run validation
-                if (self.epoch % cfg.training.val_every) == 0:
+                if is_main_process and (self.epoch % cfg.training.val_every) == 0:
                     with torch.no_grad():
                         val_losses = list()
                         with tqdm.tqdm(val_dataloader, desc=f"Validation epoch {self.epoch}", 
                                 leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
                             for batch_idx, batch in enumerate(tepoch):
                                 batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
-                                loss = self.model.compute_loss(batch)
+                                model_for_loss = self.model.module if isinstance(self.model, DDP) else self.model
+                                loss = model_for_loss.compute_loss(batch)
                                 val_losses.append(loss)
                                 if (cfg.training.max_val_steps is not None) \
                                     and batch_idx >= (cfg.training.max_val_steps-1):
@@ -241,14 +293,16 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
                             step_log['val_loss'] = val_loss
 
                 # run diffusion sampling on a training batch
-                if (self.epoch % cfg.training.sample_every) == 0:
+                if is_main_process and (self.epoch % cfg.training.sample_every) == 0:
                     with torch.no_grad():
                         # sample trajectory from training set, and evaluate difference
                         batch = dict_apply(train_sampling_batch, lambda x: x.to(device, non_blocking=True))
                         obs_dict = batch['obs']
                         gt_action = batch['action']
                         
-                        result = policy.predict_action(obs_dict)
+                        # unwrap if needed for custom method
+                        model_for_pred = policy.module if isinstance(policy, DDP) else policy
+                        result = model_for_pred.predict_action(obs_dict)
                         pred_action = result['action_pred']
                         
                         if not policy.past_action_pred:
@@ -267,7 +321,7 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
                         del mse
                 
                 # checkpoint
-                if ((self.epoch + 1) % cfg.training.checkpoint_every) == 0:
+                if is_main_process and ((self.epoch + 1) % cfg.training.checkpoint_every) == 0:
                     # checkpointing
                     if cfg.checkpoint.save_last_ckpt:
                         self.save_checkpoint()
@@ -292,10 +346,14 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
 
                 # end of epoch
                 # log of last step is combined with validation and rollout
-                wandb_run.log(step_log)
-                json_logger.log(step_log)
+                if is_main_process:
+                    if wandb_run is not None:
+                        wandb_run.log(step_log)
+                    json_logger.log(step_log)
                 self.global_step += 1
                 self.epoch += 1
+        if is_distributed and dist.is_initialized():
+            dist.destroy_process_group()
 
 @hydra.main(
     version_base=None,

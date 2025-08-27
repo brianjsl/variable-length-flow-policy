@@ -16,7 +16,6 @@ n_latency_steps: 0
 dataset_obs_steps: ${n_obs_steps}
 past_action_visible: False
 keypoint_visible_rate: 1.0
-obs_as_cond: True
 
 policy:
   _target_: diffusion_policy.policy.diffusion_transformer_hybrid_image_policy.DiffusionTransformerHybridImagePolicy
@@ -52,8 +51,6 @@ policy:
   p_drop_emb: 0.0
   p_drop_attn: 0.3
   causal_attn: True
-  time_as_cond: True # if false, use BERT like encoder only arch, time as input
-  obs_as_cond: ${obs_as_cond}
 
   # scheduler.step params
   # predict_epsilon: True

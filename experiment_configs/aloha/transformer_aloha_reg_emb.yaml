@@ -50,7 +50,6 @@ n_action_steps: ${global_action}
 n_latency_steps: 0
 n_obs_steps: ${global_obs}
 name: train_diffusion_transformer_hybrid
-obs_as_cond: true
 optimizer:
   betas:
   - 0.9
@@ -78,7 +77,6 @@ policy:
   n_head: 4
   n_layer: 8
   n_obs_steps: ${global_obs}
-  obs_as_cond: true
   obs_encoder_group_norm: true
   p_drop_attn: 0.3
   p_drop_emb: 0.0
@@ -102,7 +100,6 @@ policy:
         - 84
         - 84
         type: rgb
-  time_as_cond: true
 shape_meta:
   action:
     shape:
