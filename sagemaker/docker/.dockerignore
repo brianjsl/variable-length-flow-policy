@@ -1,0 +1,3 @@
+# Note: During build process, this copied to one folder above `lbm`.
+/lbm/bazel-*
+# We want to keep tools/awscli so that the container can use it.

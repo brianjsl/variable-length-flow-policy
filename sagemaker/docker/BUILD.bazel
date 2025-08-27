@@ -1,0 +1,14 @@
+load("//tools/skylark:lbm_py.bzl", "lbm_py_test")
+load("//tools/skylark:lint.bzl", "add_lint_tests")
+
+lbm_py_test(
+    name = "docker_dependency_test",
+    srcs = ["test/docker_dependency_test.py"],
+    data = [
+        "Dockerfile",
+        "//:lbm_requirements_raw",
+    ],
+    deps = ["//diffusion_policy/common:path_util_py"],
+)
+
+add_lint_tests()

@@ -1,0 +1,9 @@
+This folder includes a Dockerfile derived from
+https://github.com/aws/deep-learning-containers, licensed under the
+Apache License, Version 2.0. The following NOTICE is reproduced here
+and applies only to the Dockerfile in this folder:
+
+-------------------------------------------------------------------------------
+Copyright 2020 Amazon.com, Inc. or its affiliates.
+All Rights Reserved.
+-------------------------------------------------------------------------------
